@@ -1,0 +1,4 @@
+node_modules/
+crank.log
+.env
+.DS_Store
