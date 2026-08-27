@@ -120,8 +120,12 @@ async function pass(vault) {
   if (whole === 0n) { log("   nothing free to write against"); return; }
 
   const [, spot] = await pub.readContract({ address: feed, abi: feedAbi, functionName: "latestRoundData" });
-  const strike = (spot * STRIKE_BPS) / 10000n;
-  const expiry = now + TENOR_DAYS * 86400n;
+  // The board lists fixed instruments: round dollar strikes and Friday-close
+  // expiries. Writing off-grid would put contracts nobody's screen points at,
+  // so the strike is rounded to the exchange-style step for this price and the
+  // expiry is the next Friday 20:00 UTC at least TENOR_DAYS - 2 days out.
+  const strike = gridStrike((spot * STRIKE_BPS) / 10000n);
+  const expiry = nextFridayClose(Number(now) + (Number(TENOR_DAYS) - 2) * 86400);
   log(`   writing ${whole} call(s), strike ${Number(strike) / 1e8}, expiry ${new Date(Number(expiry) * 1000).toISOString().slice(0, 10)}`);
   for (let n = 0n; n < whole; n++) {
     await send({ address: vault, abi: vaultAbi, functionName: "write", args: [strike, Number(expiry)] });
@@ -129,6 +133,23 @@ async function pass(vault) {
 
   // 3. fold any premiums that arrived into the per-share running total
   await send({ address: vault, abi: vaultAbi, functionName: "collect" });
+}
+
+/** Exchange-style strike spacing, in the feed's 1e8 units. */
+function gridStrike(raw1e8) {
+  const dollars = Number(raw1e8) / 1e8;
+  const step = dollars < 50 ? 1 : dollars < 100 ? 2.5 : dollars < 250 ? 5 : dollars < 500 ? 10 : dollars < 1000 ? 25 : 50;
+  return BigInt(Math.round((Math.round(dollars / step) * step) * 1e8));
+}
+
+/** The first Friday 20:00 UTC at or after `after` (unix seconds). */
+function nextFridayClose(after) {
+  const d = new Date(after * 1000);
+  d.setUTCHours(20, 0, 0, 0);
+  while (d.getUTCDay() !== 5 || d.getTime() / 1000 < after) {
+    d.setUTCDate(d.getUTCDate() + 1);
+  }
+  return Math.floor(d.getTime() / 1000);
 }
 
 async function main() {
