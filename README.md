@@ -1,25 +1,92 @@
-# Crank
+# saturn2022-crank
 
-The vault's hands. Settles options past expiry, writes fresh ones against free
-stock, folds arrived premiums into the per-share total. It decides nothing about
-price: premiums are computed on chain when a buyer pays, so a wrong number here
-buys nobody anything.
+The keeper server for [saturn2022](https://saturn2022.com) vaults. Reads
+the state of every covered-call vault on Robinhood Chain, writes fresh options
+at the strike and expiry the board expects, settles what has expired, and folds
+premiums back into the per-share running total.
+
+The crank decides nothing about price. Premiums are computed on chain when a
+buyer pays, from Chainlink and Black-Scholes, so a wrong number here buys
+nobody anything. The keeper only sends transactions; every path moves assets
+between the vault and the house.
+
+## What it does, one pass at a time
+
+For each vault in `VAULTS`, on every tick:
+
+1. Read `free()`: shares sitting in the vault that are not escrowed against an
+   open option.
+2. For each free share, `write(strike, expiry)` a covered call, at
+   `STRIKE_BPS/10000` of the feed's spot, expiring on the next Friday close at
+   least `TENOR_DAYS - 2` days away. This lands on the board's grid: rounded
+   dollar strikes and Friday close expiries.
+3. For each open option past expiry, pin the settlement round (the last
+   Chainlink round at or before expiry) and call `settle()`. The share
+   partitions itself: `max(price - strike, 0) / price` to the buyer, the rest
+   back to the vault.
+4. Call `collect()` to fold any premiums that arrived into the per-share
+   accumulator so depositors can `claim()` them.
+
+## What the key can do
+
+The keeper key can `write` and `settle` on vaults in `VAULTS`. Nothing else.
+Both verbs move assets only between the vault and the house, never out to
+anyone. A stolen key can write badly-struck options, tying up the vault's
+shares until they expire; it cannot take a share.
+
+## Configuration
 
 ```
-CRANK_KEY=0x...   the vault's keeper key
-VAULTS=0xc79Aa3ac7Ef7905608fF42153768CAE194D2092B,0x379203E346E66ddFB2c69208699904846aa2553F,0xf04a8f4D8D390d665E8D0d345A2D6d59913CB581,0x0c2bcFcC8A732B113d5f9EB21D62dFF6Cb688180,0x3920B885217b43f1D34e8b50b33e931c0affaC90,0xC733DC6fE301B8a1B985bC0f355B0F32C690B213,0x74B7bd959E11b3086A5BF3B1E4332db27a31568b,0x0C7287cC20d0F353b389D9A88Bb8944bC4B53Cb4,0x917265B4DbA07ef1F910F7fab4BFA4B6de3A995a,0xE43f603b67DCB25b4Fa47B04DB15e44f9165fa51,0x7699a03c49b1Fe11Ceff1DDe653aDbBEe687C91b,0x089B8B8bC4b8f3C1015E7d90fFEB47a7916EcC04,0x8c4E83bE143fD809E39f547182f1680EA7112bdd,0xfB0030C21297f5E469de53975f32951650Efc7e0,0x2db893D23b8Aba629EB02da234902C6670F92d47,0x059938c5f044f2ab5d3090c8e21b20b84BF36F25,0x4E7f659537556989E811035fb0417f7E33096595
-STRIKE_BPS=11000  strike at 110% of spot
-TENOR_DAYS=7
-INTERVAL_SEC=3600
-DRY_RUN=1         decide and print, never send
+HOOD_RPC        node endpoint       (default: the public one)
+CRANK_KEY       0x-prefixed private key of the keeper
+VAULTS          comma-separated vault addresses
+STRIKE_BPS      strike as basis points of spot   (default 11000, +10%)
+TENOR_DAYS     days to expiry, rounded to next Friday close (default 7)
+INTERVAL_SEC    seconds between passes           (default 3600)
+DRY_RUN         "1" to decide and print, never send
 ```
+
+## Running
 
 ```
 npm install
-DRY_RUN=1 npm run once      # one pass, nothing sent
-npm start                   # the loop
+DRY_RUN=1 npm run once      # one pass, prints intent, nothing sent
+npm start                   # the loop, sending
 ```
 
-The key can do two things, write and settle, and both move assets only between
-the vault and the house. A stolen crank key can write badly-struck options; it
-cannot take a share.
+## Deployment
+
+Two options, either works.
+
+### Railway
+
+`railway.json` is included. Push the repo to a Railway service, set the
+environment variables above in the dashboard, and it runs on their always-on
+container with automatic restarts.
+
+### macOS launchd
+
+Create a plist under `~/Library/LaunchAgents/`:
+
+```xml
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>fun.saturn2022.crank</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/zsh</string>
+    <string>/path/to/run.sh</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+</dict>
+</plist>
+```
+
+Where `run.sh` exports the env vars and execs `node crank.mjs`.
+
+## Auditing a run
+
+`DRY_RUN=1` prints exactly what the loop would send without sending anything.
+Every write and settle logs the vault, strike, expiry and, on send, the tx
+hash, so an operator can trace any state change back to a signed intent.
