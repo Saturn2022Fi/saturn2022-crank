@@ -15,8 +15,21 @@
 //   VAULTS          comma-separated vault addresses
 //   STRIKE_BPS      strike as basis points of spot   (default 11000, +10%)
 //   TENOR_DAYS      days to expiry                   (default 7: the longest tenor the backtest measured, scripts/11-backtest.mjs)
+//   TENOR_MINUTES   minutes to expiry, overrides TENOR_DAYS when set
 //   INTERVAL_SEC    seconds between passes           (default 3600)
 //   DRY_RUN         "1" to decide but never send
+//
+// TENOR_MINUTES exists for the short end, where the weekly board does not
+// reach. An option's whole time value lives inside roughly one standard
+// deviation of spot, and over an hour that is about 0.7%, so the dollar grid
+// the board is built on steps clean over it: the nearest listed strike to a
+// $143 spot is $145, which prices at a third of the vault's premium floor and
+// is refused. A short tenor therefore writes off the board's grid, at a strike
+// a little under spot, and shows up in the contracts table rather than in the
+// chain. Under spot rather than at it because the strike is fixed here and
+// the premium is computed on chain when the transaction lands: at the money a
+// 1% dip in that gap prices the write under the floor and reverts it, while
+// half a percent in the money carries six times the floor and survives.
 
 import {
   createPublicClient, createWalletClient, http, parseAbi, defineChain,
@@ -26,6 +39,8 @@ import { privateKeyToAccount } from "viem/accounts";
 const RPC = process.env.HOOD_RPC ?? "https://rpc.mainnet.chain.robinhood.com";
 const STRIKE_BPS = BigInt(process.env.STRIKE_BPS ?? 11000);
 const TENOR_DAYS = BigInt(process.env.TENOR_DAYS ?? 7);
+const TENOR_MINUTES = process.env.TENOR_MINUTES ? Number(process.env.TENOR_MINUTES) : null;
+const FRESH_SEC = Number(process.env.FRESH_SEC ?? 7200);
 const INTERVAL = Number(process.env.INTERVAL_SEC ?? 3600) * 1000;
 const DRY = process.env.DRY_RUN === "1";
 
@@ -119,14 +134,33 @@ async function pass(vault) {
   const whole = freeNow / 10n ** 18n;
   if (whole === 0n) { log("   nothing free to write against"); return; }
 
-  const [, spot] = await pub.readContract({ address: feed, abi: feedAbi, functionName: "latestRoundData" });
+  const [, spot, , updatedAt] = await pub.readContract({ address: feed, abi: feedAbi, functionName: "latestRoundData" });
+
+  // The feed follows the underlying's market session: rounds arrive every few
+  // minutes while it trades and stop entirely overnight and on holidays. A
+  // silent feed means an option written now would have no round near its
+  // expiry to settle against, so writing waits for the session instead of a
+  // calendar: freshness is the market being open, measured at the source.
+  const age = Number(now - BigInt(updatedAt));
+  if (age > FRESH_SEC) {
+    log(`   feed silent for ${(age / 3600).toFixed(1)}h (market closed), not writing`);
+    return;
+  }
+
   // The board lists fixed instruments: round dollar strikes and Friday-close
   // expiries. Writing off-grid would put contracts nobody's screen points at,
   // so the strike is rounded to the exchange-style step for this price and the
   // expiry is the next Friday 20:00 UTC at least TENOR_DAYS - 2 days out.
-  const strike = gridStrike((spot * STRIKE_BPS) / 10000n);
-  const expiry = nextFridayClose(Number(now) + (Number(TENOR_DAYS) - 2) * 86400);
-  log(`   writing ${whole} call(s), strike ${Number(strike) / 1e8}, expiry ${new Date(Number(expiry) * 1000).toISOString().slice(0, 10)}`);
+  const raw = (spot * STRIKE_BPS) / 10000n;
+  const short = TENOR_MINUTES !== null;
+  const strike = short ? centStrike(raw) : gridStrike(raw);
+  const expiry = short
+    ? Number(now) + TENOR_MINUTES * 60
+    : nextFridayClose(Number(now) + (Number(TENOR_DAYS) - 2) * 86400);
+  const when = short
+    ? `${TENOR_MINUTES}min (${new Date(expiry * 1000).toISOString().slice(11, 19)}Z)`
+    : new Date(expiry * 1000).toISOString().slice(0, 10);
+  log(`   writing ${whole} call(s), strike ${Number(strike) / 1e8}, expiry ${when}`);
   for (let n = 0n; n < whole; n++) {
     await send({ address: vault, abi: vaultAbi, functionName: "write", args: [strike, Number(expiry)] });
   }
@@ -140,6 +174,11 @@ function gridStrike(raw1e8) {
   const dollars = Number(raw1e8) / 1e8;
   const step = dollars < 50 ? 1 : dollars < 100 ? 2.5 : dollars < 250 ? 5 : dollars < 500 ? 10 : dollars < 1000 ? 25 : 50;
   return BigInt(Math.round((Math.round(dollars / step) * step) * 1e8));
+}
+
+/** Strike to the cent, for tenors too short for the dollar grid to price. */
+function centStrike(raw1e8) {
+  return (raw1e8 / 1_000_000n) * 1_000_000n;
 }
 
 /** The first Friday 20:00 UTC at or after `after` (unix seconds). */

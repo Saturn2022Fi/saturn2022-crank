@@ -19,7 +19,12 @@ For each vault in `VAULTS`, on every tick:
 2. For each free share, `write(strike, expiry)` a covered call, at
    `STRIKE_BPS/10000` of the feed's spot, expiring on the next Friday close at
    least `TENOR_DAYS - 2` days away. This lands on the board's grid: rounded
-   dollar strikes and Friday close expiries.
+   dollar strikes and Friday close expiries. With `TENOR_MINUTES` set the
+   crank writes the short end instead: expiry that many minutes out, strike
+   to the cent, and only while the feed is publishing rounds. The feed goes
+   silent outside the underlying's market session, and an option written into
+   that silence would have no round near its expiry to settle against, so
+   feed freshness is the market calendar, read from the source.
 3. For each open option past expiry, pin the settlement round (the last
    Chainlink round at or before expiry) and call `settle()`. The share
    partitions itself: `max(price - strike, 0) / price` to the buyer, the rest
@@ -41,7 +46,9 @@ HOOD_RPC        node endpoint       (default: the public one)
 CRANK_KEY       0x-prefixed private key of the keeper
 VAULTS          comma-separated vault addresses
 STRIKE_BPS      strike as basis points of spot   (default 11000, +10%)
-TENOR_DAYS     days to expiry, rounded to next Friday close (default 7)
+TENOR_DAYS      days to expiry, rounded to next Friday close (default 7)
+TENOR_MINUTES   minutes to expiry, overrides TENOR_DAYS when set
+FRESH_SEC       max feed-round age before writes pause (default 7200)
 INTERVAL_SEC    seconds between passes           (default 3600)
 DRY_RUN         "1" to decide and print, never send
 ```
