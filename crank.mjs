@@ -65,7 +65,7 @@ const vaultAbi = parseAbi([
 ]);
 const houseAbi = parseAbi([
   "function series(uint256) view returns (uint32 market, address writer, address buyer, uint96 strike, uint40 expiry, bool settled)",
-  "function markets(uint256) view returns (address stock, address feed, int64 deviation)",
+  "function markets(uint256) view returns (address stock, address feed, int64 deviation, uint16 markupBps)",
 ]);
 const feedAbi = parseAbi([
   "function latestRoundData() view returns (uint80, int256, uint256, uint256, uint80)",
