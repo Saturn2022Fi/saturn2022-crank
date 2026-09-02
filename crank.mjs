@@ -49,7 +49,17 @@ const hood = defineChain({
   name: "Robinhood Chain",
   nativeCurrency: { name: "Ether", symbol: "ETH", decimals: 18 },
   rpcUrls: { default: { http: [RPC] } },
+  contracts: { multicall3: { address: "0xcA11bde05977b3631167028862bE2a173976CA11" } },
 });
+
+// The public node meters requests per source address, and a hosted container
+// shares its source address with strangers. So reads are batched through
+// Multicall3 (one request per vault instead of six), vaults are visited with a
+// pause between them, and a pass that still hits the meter waits out the
+// window and tries once more rather than skipping the vault for ten minutes.
+const PAUSE_MS = Number(process.env.PAUSE_MS ?? 1500);
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const isRateLimit = (e) => /rate limit/i.test(`${e.shortMessage ?? ""} ${e.details ?? ""} ${e.message ?? ""}`);
 
 const vaultAbi = parseAbi([
   "function stock() view returns (address)",
@@ -91,11 +101,20 @@ const wallet = account ? createWalletClient({ account, chain: hood, transport: t
 /// back rather than taking the latest: the latest can be days after expiry.
 async function roundAtOrBefore(feed, t) {
   const [latest] = await pub.readContract({ address: feed, abi: feedAbi, functionName: "latestRoundData" });
-  for (let i = latest; i > latest - 500n; i--) {
-    const [, , , ts] = await pub.readContract({
-      address: feed, abi: feedAbi, functionName: "getRoundData", args: [i],
+  const STEP = 25n;
+  for (let from = latest; from > latest - 500n; from -= STEP) {
+    const ids = [];
+    for (let i = from; i > from - STEP && i > latest - 500n; i--) ids.push(i);
+    const rows = await pub.multicall({
+      contracts: ids.map((i) => ({ address: feed, abi: feedAbi, functionName: "getRoundData", args: [i] })),
+      allowFailure: true,
     });
-    if (ts !== 0n && ts <= t) return i;
+    for (let k = 0; k < ids.length; k++) {
+      const r = rows[k];
+      if (r.status !== "success") continue;
+      const ts = r.result[3];
+      if (ts !== 0n && ts <= t) return ids[k];
+    }
   }
   return null;
 }
@@ -109,14 +128,12 @@ async function send(fn) {
 }
 
 async function pass(vault) {
-  const [stock, house, marketId, keeper, free, openCount] = await Promise.all([
-    pub.readContract({ address: vault, abi: vaultAbi, functionName: "stock" }),
-    pub.readContract({ address: vault, abi: vaultAbi, functionName: "house" }),
-    pub.readContract({ address: vault, abi: vaultAbi, functionName: "marketId" }),
-    pub.readContract({ address: vault, abi: vaultAbi, functionName: "keeper" }),
-    pub.readContract({ address: vault, abi: vaultAbi, functionName: "free" }),
-    pub.readContract({ address: vault, abi: vaultAbi, functionName: "openCount" }),
-  ]);
+  const [stock, house, marketId, keeper, free, openCount] = await pub.multicall({
+    contracts: ["stock", "house", "marketId", "keeper", "free", "openCount"].map((fn) => (
+      { address: vault, abi: vaultAbi, functionName: fn }
+    )),
+    allowFailure: false,
+  });
   log(`vault ${vault}  free ${Number(free) / 1e18} shares, ${openCount} open`);
 
   if (account && keeper.toLowerCase() !== account.address.toLowerCase()) {
@@ -127,9 +144,19 @@ async function pass(vault) {
 
   // 1. settle anything past expiry, newest index first so the swap-and-pop
   //    inside the vault cannot shuffle an index out from under this loop.
+  const ids = Number(openCount) === 0 ? [] : await pub.multicall({
+    contracts: Array.from({ length: Number(openCount) }, (_, i) => (
+      { address: vault, abi: vaultAbi, functionName: "openSeries", args: [BigInt(i)] }
+    )),
+    allowFailure: false,
+  });
+  const rows = ids.length === 0 ? [] : await pub.multicall({
+    contracts: ids.map((id) => ({ address: house, abi: houseAbi, functionName: "series", args: [id] })),
+    allowFailure: false,
+  });
   for (let i = Number(openCount) - 1; i >= 0; i--) {
-    const id = await pub.readContract({ address: vault, abi: vaultAbi, functionName: "openSeries", args: [BigInt(i)] });
-    const s = await pub.readContract({ address: house, abi: houseAbi, functionName: "series", args: [id] });
+    const id = ids[i];
+    const s = rows[i];
     const expiry = BigInt(s[4]);
     if (expiry > now) continue;
     const round = await roundAtOrBefore(feed, expiry);
@@ -210,12 +237,20 @@ async function main() {
   const once = process.argv.includes("--once");
   for (;;) {
     for (const v of vaults) {
-      try { await pass(v); }
-      catch (e) {
-        const status = e.status ? ` (http ${e.status})` : "";
-        const detail = e.details ? `: ${String(e.details).replace(/\s+/g, " ").slice(0, 160)}` : "";
-        log(`   vault ${v} failed this pass: ${e.shortMessage ?? e.message}${status}${detail}`);
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try { await pass(v); break; }
+        catch (e) {
+          if (isRateLimit(e) && attempt === 0) {
+            log(`   vault ${v} hit the node's rate limit, waiting 65s`);
+            await sleep(65_000);
+            continue;
+          }
+          const status = e.status ? ` (http ${e.status})` : "";
+          const detail = e.details ? `: ${String(e.details).replace(/\s+/g, " ").slice(0, 160)}` : "";
+          log(`   vault ${v} failed this pass: ${e.shortMessage ?? e.message}${status}${detail}`);
+        }
       }
+      await sleep(PAUSE_MS);
     }
     if (once) return;
     await new Promise((r) => setTimeout(r, INTERVAL));
