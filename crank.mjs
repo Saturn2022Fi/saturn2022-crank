@@ -65,7 +65,7 @@ const vaultAbi = parseAbi([
 ]);
 const houseAbi = parseAbi([
   "function series(uint256) view returns (uint32 market, address writer, address buyer, uint96 strike, uint40 expiry, bool settled)",
-  "function markets(uint256) view returns (address stock, address feed, int64 deviation, uint16 markupBps)",
+  "function markets(uint256) view returns (address stock, address feed, int64 deviation)",
 ]);
 const feedAbi = parseAbi([
   "function latestRoundData() view returns (uint80, int256, uint256, uint256, uint80)",
@@ -74,9 +74,18 @@ const feedAbi = parseAbi([
 
 const log = (...a) => console.log(new Date().toISOString(), ...a);
 
-const pub = createPublicClient({ chain: hood, transport: http(RPC) });
+// The public endpoint sits behind an edge that sometimes answers a bare
+// client with an error page instead of JSON. Name ourselves, give a slow
+// answer time, and retry a few times before calling a pass failed.
+const transport = () => http(RPC, {
+  fetchOptions: { headers: { "user-agent": "saturn2022-crank/1.0" } },
+  timeout: 20_000,
+  retryCount: 3,
+  retryDelay: 750,
+});
+const pub = createPublicClient({ chain: hood, transport: transport() });
 const account = process.env.CRANK_KEY ? privateKeyToAccount(process.env.CRANK_KEY) : null;
-const wallet = account ? createWalletClient({ account, chain: hood, transport: http(RPC) }) : null;
+const wallet = account ? createWalletClient({ account, chain: hood, transport: transport() }) : null;
 
 /// The last round at or before `t`. Settlement is pinned to it, so this walks
 /// back rather than taking the latest: the latest can be days after expiry.
@@ -202,7 +211,11 @@ async function main() {
   for (;;) {
     for (const v of vaults) {
       try { await pass(v); }
-      catch (e) { log(`   vault ${v} failed this pass: ${e.shortMessage ?? e.message}`); }
+      catch (e) {
+        const status = e.status ? ` (http ${e.status})` : "";
+        const detail = e.details ? `: ${String(e.details).replace(/\s+/g, " ").slice(0, 160)}` : "";
+        log(`   vault ${v} failed this pass: ${e.shortMessage ?? e.message}${status}${detail}`);
+      }
     }
     if (once) return;
     await new Promise((r) => setTimeout(r, INTERVAL));
