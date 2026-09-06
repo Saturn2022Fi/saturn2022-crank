@@ -37,6 +37,10 @@ import {
 import { privateKeyToAccount } from "viem/accounts";
 
 const RPC = process.env.HOOD_RPC ?? "https://rpc.mainnet.chain.robinhood.com";
+// The same hands work any chain the house is on: Base carries markets whose
+// assets have no options anywhere, and the vault there behaves identically.
+const CHAIN_ID = Number(process.env.CHAIN_ID ?? 4663);
+const CHAIN_NAME = process.env.CHAIN_NAME ?? "Robinhood Chain";
 const STRIKE_BPS = BigInt(process.env.STRIKE_BPS ?? 11000);
 const TENOR_DAYS = BigInt(process.env.TENOR_DAYS ?? 7);
 const TENOR_MINUTES = process.env.TENOR_MINUTES ? Number(process.env.TENOR_MINUTES) : null;
@@ -45,8 +49,8 @@ const INTERVAL = Number(process.env.INTERVAL_SEC ?? 3600) * 1000;
 const DRY = process.env.DRY_RUN === "1";
 
 const hood = defineChain({
-  id: 4663,
-  name: "Robinhood Chain",
+  id: CHAIN_ID,
+  name: CHAIN_NAME,
   nativeCurrency: { name: "Ether", symbol: "ETH", decimals: 18 },
   rpcUrls: { default: { http: [RPC] } },
   contracts: { multicall3: { address: "0xcA11bde05977b3631167028862bE2a173976CA11" } },
@@ -87,7 +91,12 @@ const log = (...a) => console.log(new Date().toISOString(), ...a);
 // The public endpoint sits behind an edge that sometimes answers a bare
 // client with an error page instead of JSON. Name ourselves, give a slow
 // answer time, and retry a few times before calling a pass failed.
-const transport = () => http(RPC, {
+// Reading and sending can want different nodes. The read side makes a burst
+// per pass (a settle scans back through feed rounds), which the generous
+// public nodes serve and the ones that accept transactions meter; the send
+// side makes two calls an hour. So each goes where it is welcome, and a chain
+// with one good node for both simply leaves SEND_RPC unset.
+const transport = (url = RPC) => http(url, {
   fetchOptions: { headers: { "user-agent": "saturn2022-crank/1.0" } },
   timeout: 20_000,
   retryCount: 3,
@@ -95,7 +104,7 @@ const transport = () => http(RPC, {
 });
 const pub = createPublicClient({ chain: hood, transport: transport() });
 const account = process.env.CRANK_KEY ? privateKeyToAccount(process.env.CRANK_KEY) : null;
-const wallet = account ? createWalletClient({ account, chain: hood, transport: transport() }) : null;
+const wallet = account ? createWalletClient({ account, chain: hood, transport: transport(process.env.SEND_RPC ?? RPC) }) : null;
 
 /// The last round at or before `t`. Settlement is pinned to it, so this walks
 /// back rather than taking the latest: the latest can be days after expiry.
