@@ -13,6 +13,9 @@
 //   HOOD_RPC        node endpoint            (default: the public one)
 //   CRANK_KEY       0x-prefixed private key  (required to send)
 //   VAULTS          comma-separated vault addresses
+//   FACTORY         an OptionFactory; every vault it has opened is cranked too,
+//                   re-read each pass, so a market opened by a stranger is
+//                   settled and rewritten from its first hour
 //   STRIKE_BPS      strike as basis points of spot   (default 11000, +10%)
 //   TENOR_DAYS      days to expiry                   (default 7: the longest tenor the backtest measured, scripts/11-backtest.mjs)
 //   TENOR_MINUTES   minutes to expiry, overrides TENOR_DAYS when set
@@ -76,6 +79,10 @@ const vaultAbi = parseAbi([
   "function write(uint96 strike, uint40 expiry) returns (uint256)",
   "function settle(uint256 index, uint80 roundId)",
   "function collect()",
+]);
+const factoryAbi = parseAbi([
+  "function vaultCount() view returns (uint256)",
+  "function vaults(uint256) view returns (address)",
 ]);
 const houseAbi = parseAbi([
   "function series(uint256) view returns (uint32 market, address writer, address buyer, uint96 strike, uint40 expiry, bool settled)",
@@ -236,15 +243,31 @@ function nextFridayClose(after) {
   return Math.floor(d.getTime() / 1000);
 }
 
+/// The vaults to visit: the ones named in VAULTS, plus every one the factory
+/// has opened, read fresh so a market opened since the last pass is included.
+async function vaultList() {
+  const named = (process.env.VAULTS ?? "").split(",").map((v) => v.trim()).filter(Boolean);
+  const factory = (process.env.FACTORY ?? "").trim();
+  if (!factory) return named;
+  const n = await pub.readContract({ address: factory, abi: factoryAbi, functionName: "vaultCount" });
+  const opened = n === 0n ? [] : await pub.multicall({
+    contracts: Array.from({ length: Number(n) }, (_, i) => ({ address: factory, abi: factoryAbi, functionName: "vaults", args: [BigInt(i)] })),
+    allowFailure: false,
+  });
+  const seen = new Set(named.map((v) => v.toLowerCase()));
+  return [...named, ...opened.filter((v) => !seen.has(v.toLowerCase()))];
+}
+
 async function main() {
-  const vaults = (process.env.VAULTS ?? "").split(",").map((v) => v.trim()).filter(Boolean);
-  if (!vaults.length) { console.error("set VAULTS to one or more vault addresses"); process.exit(1); }
+  let vaults = await vaultList();
+  if (!vaults.length) { console.error("set VAULTS or FACTORY"); process.exit(1); }
   log(`crank up. ${vaults.length} vault(s), every ${INTERVAL / 1000}s${DRY ? ", dry run" : ""}`);
   if (account) log(`signing as ${account.address}`);
   else log("no CRANK_KEY: reading only");
 
   const once = process.argv.includes("--once");
   for (;;) {
+    try { vaults = await vaultList(); } catch (e) { log(`   could not read the factory's vaults: ${e.shortMessage ?? e.message}`); }
     for (const v of vaults) {
       for (let attempt = 0; attempt < 2; attempt++) {
         try { await pass(v); break; }
